@@ -10,8 +10,8 @@ from flask import (
     flash
 )
 
-from google import genai
-from google.genai import types
+from groq import Groq
+from groq import APIError, AuthenticationError, RateLimitError
 
 
 app = Flask(__name__)
@@ -44,95 +44,123 @@ def index():
 
         else:
 
-            key = os.environ.get("GEMINI_API_KEY")
+            key = os.environ.get("GROQ_API_KEY")
 
             if not key:
-                flash("Gemini API key is not configured.")
+                flash("Groq API key is not configured.")
 
             else:
 
                 try:
 
-                    client = genai.Client(api_key=key)
+                    client = Groq(api_key=key)
 
-                    response = client.models.generate_content(
+                    response = client.chat.completions.create(
+
                         model=os.environ.get(
-                            "GEMINI_MODEL",
-                            "gemini-3.8-flash"
+                            "GROQ_MODEL",
+                            "openai/gpt-oss-20b"
                         ),
 
-                        contents=(
-                            "You are NayaDrishti AI, an AI-powered "
-                            "news research assistant. "
-                            "Research the following news topic using "
-                            "Google Search and reliable sources. "
-                            "Do not invent facts. "
-                            "Clearly distinguish confirmed facts "
-                            "from uncertain information. "
-                            "Provide a concise Nepali summary and "
-                            "a concise English summary. "
-                            "Include relevant source links. "
-                            "Mention dates where relevant. "
-                            "News topic: " + topic
-                        ),
-
-                        config=types.GenerateContentConfig(
-                            tools=[
-                                types.Tool(
-                                    google_search=types.GoogleSearch()
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You are NayaDrishti AI, an "
+                                    "AI-powered news research assistant. "
+                                    "Research news topics carefully. "
+                                    "Use reliable and recent sources. "
+                                    "Never invent facts, dates, quotes "
+                                    "or source links. "
+                                    "Clearly separate verified facts "
+                                    "from uncertain information. "
+                                    "Provide a concise Nepali summary "
+                                    "and a concise English summary. "
+                                    "Include source links and publication "
+                                    "dates whenever available."
                                 )
-                            ]
-                        )
+                            },
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Research this news topic using "
+                                    "current web information. "
+                                    "Find reliable sources and explain "
+                                    "the important developments. "
+                                    "News topic: " + topic
+                                )
+                            }
+                        ],
+
+                        tools=[
+                            {"type": "browser_search"}
+                        ],
+
+                        tool_choice="auto",
+
+                        temperature=1,
+
+                        max_completion_tokens=4096,
+
+                        reasoning_effort="low",
+
+                        citation_options="enabled"
                     )
 
-                    result = response.text or (
-                        "The AI did not return any text. "
-                        "Please try another topic."
+                    result = (
+                        response.choices[0].message.content
+                        or "No research result was returned. "
+                           "Please try again."
                     )
 
-                    # Add source links from Google's search results.
-                    sources = []
+                except AuthenticationError:
 
-                    if response.candidates:
-                        metadata = (
-                            response.candidates[0].grounding_metadata
-                        )
+                    app.logger.exception(
+                        "Groq authentication failed"
+                    )
 
-                        if metadata and metadata.grounding_chunks:
+                    flash(
+                        "Groq API key is invalid. "
+                        "Please check GROQ_API_KEY in Render."
+                    )
 
-                            for chunk in metadata.grounding_chunks:
+                except RateLimitError:
 
-                                if chunk.web and chunk.web.uri:
+                    app.logger.exception(
+                        "Groq rate limit reached"
+                    )
 
-                                    source_title = (
-                                        chunk.web.title or "Source"
-                                    )
+                    flash(
+                        "Groq API limit reached. "
+                        "Please wait and try again."
+                    )
 
-                                    source_url = chunk.web.uri
+                except APIError:
 
-                                    source_line = (
-                                        f"- {source_title}: {source_url}"
-                                    )
+                    app.logger.exception(
+                        "Groq API request failed"
+                    )
 
-                                    if source_line not in sources:
-                                        sources.append(source_line)
-
-                    if sources:
-                        result += "\n\nSources:\n"
-                        result += "\n".join(sources)
+                    flash(
+                        "Groq service returned an error. "
+                        "Please check Render logs."
+                    )
 
                 except Exception:
 
                     app.logger.exception(
-                        "Gemini research request failed"
+                        "Unexpected Groq research error"
                     )
 
                     flash(
-                        "Gemini AI request failed. "
-                        "Please check your API key, model and Render logs."
+                        "Research failed unexpectedly. "
+                        "Please check Render logs."
                     )
 
-    return render_template("index.html", result=result)
+    return render_template(
+        "index.html",
+        result=result
+    )
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -172,8 +200,6 @@ if __name__ == "__main__":
         port=int(os.environ.get("PORT", 5000))
     )
 
-            
-                   
 
 
             
