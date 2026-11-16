@@ -1,5 +1,5 @@
-import os
 
+import os
 from flask import (
     Flask,
     render_template,
@@ -9,10 +9,8 @@ from flask import (
     session,
     flash
 )
-
 from groq import Groq
-from groq import APIError, AuthenticationError, RateLimitError
-
+from groq import AuthenticationError, RateLimitError, APIError
 
 app = Flask(__name__)
 
@@ -56,88 +54,62 @@ def index():
                     client = Groq(api_key=key)
 
                     response = client.chat.completions.create(
-
                         model=os.environ.get(
                             "GROQ_MODEL",
                             "openai/gpt-oss-20b"
                         ),
-
                         messages=[
                             {
                                 "role": "system",
                                 "content": (
                                     "You are NayaDrishti AI, an "
                                     "AI-powered news research assistant. "
-                                    "Research news topics carefully. "
-                                    "Use reliable and recent sources. "
-                                    "Never invent facts, dates, quotes "
-                                    "or source links. "
-                                    "Clearly separate verified facts "
-                                    "from uncertain information. "
-                                    "Provide a concise Nepali summary "
-                                    "and a concise English summary. "
-                                    "Include source links and publication "
-                                    "dates whenever available."
+                                    "Help users understand news topics. "
+                                    "Provide a clear Nepali summary "
+                                    "and a clear English summary. "
+                                    "Use simple language. "
+                                    "Never invent facts, dates, "
+                                    "quotes or source links. "
+                                    "If you cannot verify current news, "
+                                    "clearly tell the user that the "
+                                    "information needs verification. "
+                                    "Do not pretend to have live internet "
+                                    "access. Organize your answer "
+                                    "with suitable headings."
                                 )
                             },
                             {
                                 "role": "user",
                                 "content": (
-                                    "Research this news topic using "
-                                    "current web information. "
-                                    "Find reliable sources and explain "
-                                    "the important developments. "
-                                    "News topic: " + topic
+                                    "Explain and summarize this "
+                                    "news topic in Nepali and English: "
+                                    + topic
                                 )
                             }
                         ],
-
-                        tools=[
-                            {"type": "browser_search"}
-                        ],
-
-                        tool_choice="auto",
-
-                        temperature=1,
-
-                        max_completion_tokens=4096,
-
-                        reasoning_effort="low",
-
-                        tools=[
-    {"type": "browser_search"}
-],
-
-tool_choice="auto",
-
-temperature=1,
-
-max_completion_tokens=4096,
-
-reasoning_effort="low"
+                        max_completion_tokens=4096
                     )
 
                     result = (
                         response.choices[0].message.content
-                        or "No research result was returned. "
-                           "Please try again."
+                        or "No response received. Please try again."
                     )
 
                 except AuthenticationError:
 
                     app.logger.exception(
-                        "Groq authentication failed"
+                        "Groq authentication error"
                     )
 
                     flash(
-                        "Groq API key is invalid. "
+                        "Invalid Groq API key. "
                         "Please check GROQ_API_KEY in Render."
                     )
 
                 except RateLimitError:
 
                     app.logger.exception(
-                        "Groq rate limit reached"
+                        "Groq rate limit error"
                     )
 
                     flash(
@@ -148,23 +120,22 @@ reasoning_effort="low"
                 except APIError:
 
                     app.logger.exception(
-                        "Groq API request failed"
+                        "Groq API error"
                     )
 
                     flash(
-                        "Groq service returned an error. "
-                        "Please check Render logs."
+                        "Groq API error. Please check Render logs."
                     )
 
                 except Exception:
 
                     app.logger.exception(
-                        "Unexpected Groq research error"
+                        "Unexpected research error"
                     )
 
                     flash(
-                        "Research failed unexpectedly. "
-                        "Please check Render logs."
+                        "Research failed. "
+                        "Please check the Render logs."
                     )
 
     return render_template(
@@ -210,7 +181,11 @@ if __name__ == "__main__":
         port=int(os.environ.get("PORT", 5000))
     )
 
-
-
-            
+                    
+                   
+ 
+                       
+                   
+    
+  
         
