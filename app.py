@@ -3,7 +3,8 @@ from flask import Flask, render_template, request, redirect, url_for, session, f
 from openai import OpenAI
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-this-before-deployment")
+
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-this-secret")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "change-this-password")
 
 
@@ -17,11 +18,15 @@ def index():
     if request.method == "POST":
         topic = request.form.get("topic", "").strip()
 
-        if topic:
+        if not topic:
+            flash("Please enter a news topic.")
+
+        else:
             key = os.environ.get("OPENAI_API_KEY")
 
             if not key:
-                flash("OpenAI API key is not configured yet.")
+                flash("OpenAI API key is not configured.")
+
             else:
                 try:
                     client = OpenAI(api_key=key)
@@ -31,9 +36,9 @@ def index():
                         tools=[{"type": "web_search"}],
                         input=(
                             "Research this news topic using reliable sources. "
-                            "Do not invent facts. Give a concise Nepali summary and "
-                            "a concise English summary, with source links. Topic: "
-                            + topic
+                            "Do not invent facts. Give a concise Nepali summary "
+                            "and a concise English summary with source links. "
+                            "Topic: " + topic
                         )
                     )
 
@@ -41,7 +46,7 @@ def index():
 
                 except Exception:
                     app.logger.exception("OpenAI research request failed")
-                    flash("AI request failed. Please check Render logs.")
+                    flash("AI request failed. Check API key, billing and model settings.")
 
     return render_template("index.html", result=result)
 
@@ -52,17 +57,29 @@ def login():
         if request.form.get("password") == ADMIN_PASSWORD:
             session["logged_in"] = True
             return redirect(url_for("index"))
+
         flash("Incorrect password.")
+
     return render_template("login.html")
+
 
 @app.route("/logout")
 def logout():
     session.clear()
     return redirect(url_for("login"))
 
+
 @app.route("/health")
 def health():
     return {"status": "ok"}
 
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000))
+    )
+
+
+            
+        
