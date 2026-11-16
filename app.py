@@ -17,9 +17,10 @@ def index():
             key = os.environ.get("OPENAI_API_KEY")
             if not key:
                 flash("OpenAI API key is not configured yet.")
-            else:
+              else:
                 try:
                     client = OpenAI(api_key=key)
+
                     response = client.responses.create(
                         model=os.environ.get("OPENAI_MODEL", "gpt-4.1-mini"),
                         tools=[{"type": "web_search"}],
@@ -27,9 +28,13 @@ def index():
                                "Do not invent facts. Give a concise Nepali summary and "
                                "a concise English summary, with source links. Topic: " + topic)
                     )
+
                     result = response.output_text
-                except Exception as e:
-                    flash("AI request failed. Check API billing, key, and model settings.")
+
+                except Exception:
+                    app.logger.exception("OpenAI research request failed")
+                    flash("AI request failed. Please check Render logs.")
+
     return render_template("index.html", result=result)
 
 @app.route("/login", methods=["GET", "POST"])
