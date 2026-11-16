@@ -6,27 +6,35 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-this-before-deployment")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "change-this-password")
 
+
 @app.route("/", methods=["GET", "POST"])
 def index():
     if not session.get("logged_in"):
         return redirect(url_for("login"))
+
     result = None
+
     if request.method == "POST":
         topic = request.form.get("topic", "").strip()
+
         if topic:
             key = os.environ.get("OPENAI_API_KEY")
+
             if not key:
                 flash("OpenAI API key is not configured yet.")
-              else:
+            else:
                 try:
                     client = OpenAI(api_key=key)
 
                     response = client.responses.create(
                         model=os.environ.get("OPENAI_MODEL", "gpt-4.1-mini"),
                         tools=[{"type": "web_search"}],
-                        input=("Research this news topic using reliable sources. "
-                               "Do not invent facts. Give a concise Nepali summary and "
-                               "a concise English summary, with source links. Topic: " + topic)
+                        input=(
+                            "Research this news topic using reliable sources. "
+                            "Do not invent facts. Give a concise Nepali summary and "
+                            "a concise English summary, with source links. Topic: "
+                            + topic
+                        )
                     )
 
                     result = response.output_text
@@ -36,6 +44,7 @@ def index():
                     flash("AI request failed. Please check Render logs.")
 
     return render_template("index.html", result=result)
+
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
