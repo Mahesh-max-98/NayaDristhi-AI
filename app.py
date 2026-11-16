@@ -104,7 +104,17 @@ def index():
 
                         reasoning_effort="low",
 
-                        citation_options="enabled"
+                        tools=[
+    {"type": "browser_search"}
+],
+
+tool_choice="auto",
+
+temperature=1,
+
+max_completion_tokens=4096,
+
+reasoning_effort="low"
                     )
 
                     result = (
