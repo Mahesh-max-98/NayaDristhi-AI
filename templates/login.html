@@ -36,11 +36,21 @@
     <div class="box">
         <h1>NayaDrishti AI</h1>
         <p>News Research Assistant</p>
-        <form method="POST">
-            <input type="password" name="password"
-                   placeholder="Admin Password" required>
-            <button type="submit">Login</button>
-        </form>
+        {% with messages = get_flashed_messages() %}
+    {% for message in messages %}
+        <p style="color: red;">{{ message }}</p>
+    {% endfor %}
+{% endwith %}
+
+<form method="POST" action="{{ url_for('login') }}">
+    <input
+        type="password"
+        name="password"
+        placeholder="Admin Password"
+        required
+    >
+    <button type="submit">Login</button>
+</form>
     </div>
 </body>
 </html>
