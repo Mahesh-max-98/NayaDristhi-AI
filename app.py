@@ -9,7 +9,7 @@ import requests
 import feedparser
 
 from functools import wraps
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin
 
 from flask import (
     Flask, request, redirect, url_for,
@@ -100,8 +100,102 @@ def clean_text(value):
     return value.strip()
 
 
+
+def is_http_image_url(value):
+    """Accept only ordinary HTTP(S) image URLs."""
+    value = html.unescape(str(value or "")).strip()
+    if value.startswith("//"):
+        value = "https:" + value
+    return value if value.startswith(("https://", "http://")) else ""
+
+
+def image_from_html_fragment(fragment, page_url):
+    """Find the first image URL inside an RSS HTML fragment."""
+    if not fragment:
+        return ""
+
+    match = re.search(
+        r'<img\b[^>]*?\bsrc\s*=\s*["\']([^"\']+)["\']',
+        str(fragment),
+        flags=re.IGNORECASE
+    )
+    if not match:
+        return ""
+
+    candidate = urljoin(page_url, html.unescape(match.group(1)).strip())
+    return is_http_image_url(candidate)
+
+
+def extract_article_image(entry, article_url, headers):
+    """
+    Prefer RSS image metadata/content. If absent, try Open Graph/Twitter metadata.
+    This creates a preview only; it does not grant permission to republish.
+    """
+    for field_name in ("media_content", "media_thumbnail"):
+        media_items = entry.get(field_name, []) or []
+        if isinstance(media_items, dict):
+            media_items = [media_items]
+
+        for media in media_items:
+            if isinstance(media, dict):
+                candidate = is_http_image_url(media.get("url") or media.get("href"))
+                if candidate:
+                    return candidate
+
+    for enclosure in entry.get("enclosures", []) or []:
+        if isinstance(enclosure, dict):
+            media_type = (enclosure.get("type") or "").lower()
+            candidate = is_http_image_url(enclosure.get("href") or enclosure.get("url"))
+            if candidate and (media_type.startswith("image/") or not media_type):
+                return candidate
+
+    for content_item in entry.get("content", []) or []:
+        if isinstance(content_item, dict):
+            candidate = image_from_html_fragment(content_item.get("value", ""), article_url)
+            if candidate:
+                return candidate
+
+    candidate = image_from_html_fragment(entry.get("summary", ""), article_url)
+    if candidate:
+        return candidate
+
+    try:
+        page_response = requests.get(
+            article_url,
+            headers=headers,
+            timeout=(3, 5),
+            allow_redirects=True
+        )
+        page_response.raise_for_status()
+
+        content_type = page_response.headers.get("Content-Type", "").lower()
+        if content_type and "html" not in content_type:
+            return ""
+
+        page_url = page_response.url or article_url
+        for tag in re.findall(r"<meta\b[^>]*>", page_response.text[:500000], flags=re.IGNORECASE):
+            attrs = {}
+            for key, value in re.findall(
+                r'([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*["\']([^"\']*)["\']',
+                tag
+            ):
+                attrs[key.lower()] = html.unescape(value).strip()
+
+            meta_name = (attrs.get("property") or attrs.get("name") or "").lower()
+            if meta_name in ("og:image", "og:image:url", "twitter:image", "twitter:image:src"):
+                candidate = urljoin(page_url, attrs.get("content", ""))
+                candidate = is_http_image_url(candidate)
+                if candidate:
+                    return candidate
+
+    except Exception as error:
+        app.logger.debug("Article image lookup skipped for %s: %s", article_url, error)
+
+    return ""
+
+
 def collect_news():
-    """Collect articles from all configured RSS sources."""
+    """Collect articles and available image previews from configured RSS sources."""
 
     articles = []
     errors = []
@@ -140,10 +234,13 @@ def collect_news():
                 if not link.startswith(("https://", "http://")):
                     continue
 
+                image_url = extract_article_image(entry, link, headers)
+
                 articles.append({
                     "source": source_item["name"],
                     "title": title,
                     "link": link,
+                    "image_url": image_url,
                     "published": clean_text(
                         entry.get(
                             "published",
@@ -363,6 +460,23 @@ def news():
                 border: 1px solid #ddd;
             }
 
+            .article-image {
+                display: block;
+                width: 100%;
+                max-width: 680px;
+                max-height: 380px;
+                object-fit: cover;
+                border-radius: 8px;
+                margin: 14px 0;
+                background: #eef2f7;
+            }
+
+            .image-note {
+                color: #666;
+                font-size: 12px;
+                margin-top: -8px;
+            }
+
             .source {
                 color: #1769aa;
                 font-weight: bold;
@@ -429,6 +543,22 @@ def news():
                 </div>
 
                 <h3>{{ article.title }}</h3>
+
+                {% if article.image_url %}
+                    <a href="{{ article.link }}"
+                       target="_blank"
+                       rel="noopener noreferrer">
+                        <img class="article-image"
+                             src="{{ article.image_url }}"
+                             alt="{{ article.title }}"
+                             loading="lazy"
+                             referrerpolicy="no-referrer">
+                    </a>
+                    <p class="image-note">
+                        Image preview from the original article. Check permission
+                        and licence before reusing it in a Facebook post.
+                    </p>
+                {% endif %}
 
                 <small>{{ article.published }}</small>
 
