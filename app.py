@@ -1,6 +1,4 @@
 
-
-
 import os
 import re
 import html
@@ -10,7 +8,7 @@ import requests
 import feedparser
 
 from functools import wraps
-from urllib.parse import urlencode, urljoin
+from urllib.parse import urlencode, urljoin, urlparse
 
 from flask import (
     Flask, request, redirect, url_for,
@@ -20,22 +18,18 @@ from flask import (
 from groq import Groq
 
 
-# =====================================================
-# NAYADRISHTI AI - MAIN APPLICATION
-# =====================================================
+# =========================================================
+# NAYADRISHTI AI
+# =========================================================
 
 app = Flask(__name__)
-
 logging.basicConfig(level=logging.INFO)
 
-# ---------------- CONFIGURATION ----------------
-
 app.secret_key = os.environ.get("FLASK_SECRET_KEY")
-
 if not app.secret_key:
     raise RuntimeError("FLASK_SECRET_KEY is missing in Render.")
 
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "change-this-password")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
 FB_APP_ID = os.environ.get("FB_APP_ID")
@@ -49,23 +43,22 @@ APP_BASE_URL = os.environ.get(
 
 GRAPH_VERSION = "v27.0"
 GRAPH_URL = f"https://graph.facebook.com/{GRAPH_VERSION}"
-
 REDIRECT_URI = APP_BASE_URL + "/facebook/callback"
 
 GROQ_MODEL = "openai/gpt-oss-120b"
-
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 app.config.update(
     SESSION_COOKIE_SECURE=True,
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax"
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_NAME="nayadrishti_session"
 )
 
 
-# =====================================================
-# RSS NEWS SOURCES
-# =====================================================
+# =========================================================
+# NEWS SOURCES
+# =========================================================
 
 NEWS_SOURCES = [
     {
@@ -91,213 +84,232 @@ NEWS_SOURCES = [
 ]
 
 
-def clean_text(value):
-    """Remove HTML tags and clean RSS descriptions."""
+# =========================================================
+# GENERAL HELPERS
+# =========================================================
 
+def clean_text(value):
     value = html.unescape(value or "")
     value = re.sub(r"<[^>]+>", " ", value)
-    value = re.sub(r"\s+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
 
-    return value.strip()
 
+def valid_http_url(value):
+    try:
+        parsed = urlparse(value or "")
+        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+    except Exception:
+        return False
 
 
 def is_http_image_url(value):
-    """Accept only ordinary HTTP(S) image URLs."""
-    value = html.unescape(str(value or "")).strip()
-    if value.startswith("//"):
-        value = "https:" + value
-    return value if value.startswith(("https://", "http://")) else ""
+    if not value:
+        return False
+    return valid_http_url(value)
 
 
-def image_from_html_fragment(fragment, page_url):
-    """Find the first image URL inside an RSS HTML fragment."""
+def extract_image_from_html(fragment, base_url):
     if not fragment:
-        return ""
+        return None
 
-    match = re.search(
-        r'<img\b[^>]*?\bsrc\s*=\s*["\']([^"\']+)["\']',
-        str(fragment),
-        flags=re.IGNORECASE
-    )
-    if not match:
-        return ""
+    patterns = [
+        r'<img[^>]+src=["\']([^"\']+)["\']',
+        r'<img[^>]+data-src=["\']([^"\']+)["\']'
+    ]
 
-    candidate = urljoin(page_url, html.unescape(match.group(1)).strip())
-    return is_http_image_url(candidate)
+    for pattern in patterns:
+        match = re.search(pattern, fragment, re.I)
+        if match:
+            image_url = urljoin(base_url, html.unescape(match.group(1)))
+            if is_http_image_url(image_url):
+                return image_url
+
+    return None
 
 
-def extract_article_image(entry, article_url, headers):
-    """
-    Prefer RSS image metadata/content. If absent, try Open Graph/Twitter metadata.
-    This creates a preview only; it does not grant permission to republish.
-    """
-    for field_name in ("media_content", "media_thumbnail"):
-        media_items = entry.get(field_name, []) or []
-        if isinstance(media_items, dict):
-            media_items = [media_items]
+def extract_article_image(entry, article_url):
+    # RSS media content
+    for media in entry.get("media_content", []) or []:
+        image_url = media.get("url")
+        if is_http_image_url(image_url):
+            return image_url
 
-        for media in media_items:
-            if isinstance(media, dict):
-                candidate = is_http_image_url(media.get("url") or media.get("href"))
-                if candidate:
-                    return candidate
+    # RSS thumbnail
+    for media in entry.get("media_thumbnail", []) or []:
+        image_url = media.get("url")
+        if is_http_image_url(image_url):
+            return image_url
 
+    # Image enclosure
     for enclosure in entry.get("enclosures", []) or []:
-        if isinstance(enclosure, dict):
-            media_type = (enclosure.get("type") or "").lower()
-            candidate = is_http_image_url(enclosure.get("href") or enclosure.get("url"))
-            if candidate and (media_type.startswith("image/") or not media_type):
-                return candidate
+        image_url = enclosure.get("href") or enclosure.get("url")
+        media_type = enclosure.get("type", "")
+        if is_http_image_url(image_url) and (
+            media_type.startswith("image/") or not media_type
+        ):
+            return image_url
 
-    for content_item in entry.get("content", []) or []:
-        if isinstance(content_item, dict):
-            candidate = image_from_html_fragment(content_item.get("value", ""), article_url)
-            if candidate:
-                return candidate
-
-    candidate = image_from_html_fragment(entry.get("summary", ""), article_url)
-    if candidate:
-        return candidate
-
-    try:
-        page_response = requests.get(
-            article_url,
-            headers=headers,
-            timeout=(3, 5),
-            allow_redirects=True
+    # Image inside RSS content or summary
+    for content in entry.get("content", []) or []:
+        image_url = extract_image_from_html(
+            content.get("value", ""),
+            article_url
         )
-        page_response.raise_for_status()
+        if image_url:
+            return image_url
 
-        content_type = page_response.headers.get("Content-Type", "").lower()
-        if content_type and "html" not in content_type:
-            return ""
+    image_url = extract_image_from_html(
+        entry.get("summary", ""),
+        article_url
+    )
+    if image_url:
+        return image_url
 
-        page_url = page_response.url or article_url
-        for tag in re.findall(r"<meta\b[^>]*>", page_response.text[:500000], flags=re.IGNORECASE):
-            attrs = {}
-            for key, value in re.findall(
-                r'([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*["\']([^"\']*)["\']',
-                tag
-            ):
-                attrs[key.lower()] = html.unescape(value).strip()
+    # Try article page metadata
+    try:
+        response = requests.get(
+            article_url,
+            headers={"User-Agent": "Mozilla/5.0 NayaDrishtiAI"},
+            timeout=8,
+            stream=True
+        )
+        response.raise_for_status()
 
-            meta_name = (attrs.get("property") or attrs.get("name") or "").lower()
-            if meta_name in ("og:image", "og:image:url", "twitter:image", "twitter:image:src"):
-                candidate = urljoin(page_url, attrs.get("content", ""))
-                candidate = is_http_image_url(candidate)
-                if candidate:
-                    return candidate
+        content_type = response.headers.get("Content-Type", "")
+        if "text/html" not in content_type:
+            response.close()
+            return None
 
-    except Exception as error:
-        app.logger.debug("Article image lookup skipped for %s: %s", article_url, error)
+        chunks = []
+        total = 0
+        for chunk in response.iter_content(8192):
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            total += len(chunk)
+            if total >= 200000:
+                break
+        response.close()
 
-    return ""
+        page_html = b"".join(chunks).decode(
+            response.encoding or "utf-8",
+            errors="ignore"
+        )
+
+        patterns = [
+            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image',
+            r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image'
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, page_html, re.I)
+            if match:
+                image_url = urljoin(
+                    article_url,
+                    html.unescape(match.group(1))
+                )
+                if is_http_image_url(image_url):
+                    return image_url
+
+    except Exception:
+        app.logger.info("Could not extract article image: %s", article_url)
+
+    return None
 
 
 def collect_news():
-    """Collect articles and available image previews from configured RSS sources."""
-
     articles = []
     errors = []
 
-    headers = {
-        "User-Agent": "NayaDrishtiAI/1.0"
-    }
+    headers = {"User-Agent": "Mozilla/5.0 NayaDrishtiAI/1.0"}
 
-    for source_item in NEWS_SOURCES:
-
+    for source in NEWS_SOURCES:
         try:
             response = requests.get(
-                source_item["url"],
+                source["url"],
                 headers=headers,
-                timeout=20
+                timeout=12
             )
-
             response.raise_for_status()
 
             feed = feedparser.parse(response.content)
 
             if not feed.entries:
-                errors.append(
-                    source_item["name"] + ": No articles found."
-                )
+                errors.append(source["name"] + ": No articles found.")
                 continue
 
-            for entry in feed.entries[:10]:
-
+            for entry in feed.entries[:8]:
                 title = clean_text(entry.get("title", ""))
                 link = entry.get("link", "").strip()
 
-                if not title or not link:
+                if not title or not valid_http_url(link):
                     continue
 
-                if not link.startswith(("https://", "http://")):
-                    continue
+                summary = clean_text(
+                    entry.get("summary", "No description available.")
+                )
 
-                image_url = extract_article_image(entry, link, headers)
+                image_url = extract_article_image(entry, link)
 
                 articles.append({
-                    "source": source_item["name"],
+                    "source": source["name"],
                     "title": title,
                     "link": link,
-                    "image_url": image_url,
                     "published": clean_text(
                         entry.get(
                             "published",
                             entry.get("updated", "Date not available")
                         )
                     ),
-                    "summary": clean_text(
-                        entry.get(
-                            "summary",
-                            "No description available."
-                        )
-                    )
+                    "summary": summary,
+                    "image_url": image_url
                 })
 
         except Exception as error:
             app.logger.warning(
-                "RSS error for %s: %s",
-                source_item["name"],
+                "News feed failed for %s: %s",
+                source["name"],
                 str(error)
             )
+            errors.append(source["name"] + ": Could not load feed.")
 
-            errors.append(
-                source_item["name"] + ": Could not load feed."
-            )
+    # Remove duplicate article links
+    unique = []
+    seen = set()
 
-    return articles, errors
+    for article in articles:
+        if article["link"] not in seen:
+            seen.add(article["link"])
+            unique.append(article)
+
+    return unique, errors
 
 
-# =====================================================
-# LOGIN SYSTEM
-# =====================================================
+# =========================================================
+# LOGIN
+# =========================================================
 
 def login_required(function):
-
     @wraps(function)
     def wrapper(*args, **kwargs):
-
         if not session.get("logged_in"):
             return redirect(url_for("login"))
-
         return function(*args, **kwargs)
-
     return wrapper
 
 
 @app.route("/", methods=["GET", "POST"])
 def login():
-
     if request.method == "POST":
-
         password = request.form.get("password", "")
 
-        if secrets.compare_digest(password, ADMIN_PASSWORD):
-
+        if ADMIN_PASSWORD and secrets.compare_digest(
+            password, ADMIN_PASSWORD
+        ):
+            session.clear()
             session["logged_in"] = True
-
             return redirect(url_for("dashboard"))
 
         flash("Incorrect password.")
@@ -306,55 +318,51 @@ def login():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>NayaDrishti AI Login</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            body {
-                font-family: Arial;
-                background: #eef2f7;
-                display: flex;
-                justify-content: center;
-                align-items: center;
-                min-height: 90vh;
-            }
-            .box {
-                background: white;
-                padding: 30px;
-                border-radius: 12px;
-                width: 320px;
-                box-shadow: 0 3px 15px #ccc;
-            }
-            input, button {
-                box-sizing: border-box;
-                width: 100%;
-                padding: 12px;
-                margin-top: 12px;
-            }
-            button {
-                background: #1769aa;
-                color: white;
-                border: none;
-                cursor: pointer;
-            }
-        </style>
+      <title>NayaDrishti AI Login</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        body {
+          font-family: Arial;
+          background: #eef2f7;
+          display: flex;
+          justify-content: center;
+          align-items: center;
+          min-height: 90vh;
+        }
+        .box {
+          background: white;
+          padding: 30px;
+          border-radius: 12px;
+          width: 320px;
+          box-shadow: 0 3px 15px #ccc;
+        }
+        input, button {
+          box-sizing: border-box;
+          width: 100%;
+          padding: 12px;
+          margin-top: 12px;
+        }
+        button {
+          background: #1769aa;
+          color: white;
+          border: none;
+          cursor: pointer;
+        }
+      </style>
     </head>
     <body>
-        <div class="box">
-            <h2>NayaDrishti AI</h2>
-            <p>Admin Login</p>
-
-            {% for message in get_flashed_messages() %}
-                <p style="color:red">{{ message }}</p>
-            {% endfor %}
-
-            <form method="POST">
-                <input type="password"
-                       name="password"
-                       placeholder="Admin Password"
-                       required>
-                <button type="submit">Login</button>
-            </form>
-        </div>
+      <div class="box">
+        <h2>NayaDrishti AI</h2>
+        <p>Admin Login</p>
+        {% for message in get_flashed_messages() %}
+          <p style="color:red">{{ message }}</p>
+        {% endfor %}
+        <form method="POST">
+          <input type="password" name="password"
+                 placeholder="Admin Password" required>
+          <button type="submit">Login</button>
+        </form>
+      </div>
     </body>
     </html>
     """)
@@ -362,476 +370,360 @@ def login():
 
 @app.route("/logout")
 def logout():
-
     session.clear()
-
     return redirect(url_for("login"))
 
 
-# =====================================================
+# =========================================================
 # DASHBOARD
-# =====================================================
+# =========================================================
 
 @app.route("/dashboard")
 @login_required
 def dashboard():
-
     return render_template_string("""
     <!DOCTYPE html>
     <html>
     <head>
-        <title>NayaDrishti AI Dashboard</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            body {
-                font-family: Arial;
-                background: #f3f5f8;
-                padding: 25px;
-            }
-            .card {
-                background: white;
-                padding: 20px;
-                margin: 15px 0;
-                border-radius: 10px;
-            }
-            a {
-                color: #0757a6;
-                text-decoration: none;
-            }
-        </style>
+      <title>NayaDrishti AI Dashboard</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        body {font-family:Arial;background:#f3f5f8;padding:25px}
+        .card {background:white;padding:20px;margin:15px 0;border-radius:10px}
+        a {color:#0757a6;text-decoration:none}
+      </style>
     </head>
     <body>
-
-        <h1>NayaDrishti AI</h1>
-        <p>Your AI-powered news publishing assistant.</p>
-
-        <div class="card">
-            <h3>News Management</h3>
-            <a href="/news">Fetch Latest News</a>
-        </div>
-
-        <div class="card">
-            <h3>AI News Summary</h3>
-            <a href="/ai">Open AI Summary</a>
-        </div>
-
-        <div class="card">
-            <h3>Facebook Management</h3>
-            <a href="/facebook/login">Connect Facebook</a><br><br>
-            <a href="/facebook">View Facebook Pages</a><br><br>
-            <a href="/facebook/publish">Publish Facebook Post</a>
-        </div>
-
-        <p><a href="/logout">Logout</a></p>
-
+      <h1>NayaDrishti AI</h1>
+      <p>Your AI-powered news publishing assistant.</p>
+      <div class="card">
+        <h3>News Management</h3>
+        <a href="/news">Fetch Latest News</a>
+      </div>
+      <div class="card">
+        <h3>AI News Summary</h3>
+        <a href="/ai">Open AI Summary</a>
+      </div>
+      <div class="card">
+        <h3>Facebook Management</h3>
+        <a href="/facebook/login">Connect Facebook</a><br><br>
+        <a href="/facebook">View Facebook Pages</a><br><br>
+        <a href="/facebook/publish">Publish Facebook Post</a>
+      </div>
+      <p><a href="/logout">Logout</a></p>
     </body>
     </html>
     """)
 
-
-# =====================================================
-# FETCH NEWS AND DISPLAY AI SUMMARY BUTTONS
-# =====================================================
+# =========================================================
+# NEWS PAGE
+# =========================================================
 
 @app.route("/news")
 @login_required
 def news():
-
     articles, errors = collect_news()
 
     return render_template_string("""
     <!DOCTYPE html>
     <html>
     <head>
-        <title>NayaDrishti AI - Latest News</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-
-        <style>
-            body {
-                font-family: Arial, sans-serif;
-                background: #f3f5f8;
-                margin: 20px;
-            }
-
-            .article {
-                background: white;
-                padding: 20px;
-                margin-bottom: 18px;
-                border-radius: 10px;
-                border: 1px solid #ddd;
-            }
-
-            .article-image {
-                display: block;
-                width: 100%;
-                max-width: 680px;
-                max-height: 380px;
-                object-fit: cover;
-                border-radius: 8px;
-                margin: 14px 0;
-                background: #eef2f7;
-            }
-
-            .image-note {
-                color: #666;
-                font-size: 12px;
-                margin-top: -8px;
-            }
-
-            .source {
-                color: #1769aa;
-                font-weight: bold;
-            }
-
-            .button {
-                display: inline-block;
-                padding: 11px 16px;
-                margin-top: 10px;
-                background: #1769aa;
-                color: white;
-                border-radius: 5px;
-                border: none;
-                text-decoration: none;
-                cursor: pointer;
-            }
-
-            .original {
-                background: #555;
-            }
-
-            .error {
-                background: #ffe9e9;
-                color: #b00020;
-                padding: 10px;
-                margin: 8px 0;
-            }
-
-            button {
-                font-size: 14px;
-            }
-        </style>
+      <title>NayaDrishti AI - Latest News</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        body {
+          font-family: Arial, sans-serif;
+          background: #f3f5f8;
+          margin: 20px;
+          color: #222;
+        }
+        .article {
+          background: white;
+          padding: 20px;
+          margin-bottom: 18px;
+          border-radius: 10px;
+          border: 1px solid #ddd;
+        }
+        .source {color:#1769aa;font-weight:bold}
+        .article-image {
+          width: 100%;
+          max-width: 650px;
+          max-height: 360px;
+          object-fit: cover;
+          border-radius: 8px;
+          display: block;
+          margin: 12px 0;
+        }
+        .button {
+          display: inline-block;
+          padding: 11px 16px;
+          margin-top: 10px;
+          background: #1769aa;
+          color: white;
+          border-radius: 5px;
+          border: none;
+          text-decoration: none;
+          cursor: pointer;
+        }
+        .original {background:#555}
+        .error {
+          background:#ffe9e9;
+          color:#b00020;
+          padding:10px;
+          margin:8px 0;
+        }
+        .notice {
+          background:#fff8df;
+          padding:10px;
+          border-radius:6px;
+          font-size:13px;
+        }
+      </style>
     </head>
-
     <body>
+      <h1>NayaDrishti AI - Latest News</h1>
+      <p>Articles collected: <b>{{ articles|length }}</b></p>
+      <a class="button" href="/news">Refresh News</a>
 
-        <h1>NayaDrishti AI - Latest News</h1>
-
-        <p>
-            Articles collected:
-            <b>{{ articles|length }}</b>
-        </p>
-
-        <a class="button" href="/news">Refresh News</a>
-
-        <h2>Feed Status</h2>
-
-        {% if errors %}
-            {% for error in errors %}
-                <div class="error">{{ error }}</div>
-            {% endfor %}
-        {% else %}
-            <p>All feeds returned articles.</p>
-        {% endif %}
-
-        <h2>Latest Articles</h2>
-
-        {% for article in articles %}
-
-            <div class="article">
-
-                <div class="source">
-                    {{ article.source }}
-                </div>
-
-                <h3>{{ article.title }}</h3>
-
-                {% if article.image_url %}
-                    <a href="{{ article.link }}"
-                       target="_blank"
-                       rel="noopener noreferrer">
-                        <img class="article-image"
-                             src="{{ article.image_url }}"
-                             alt="{{ article.title }}"
-                             loading="lazy"
-                             referrerpolicy="no-referrer">
-                    </a>
-                    <p class="image-note">
-                        Image preview from the original article. Check permission
-                        and licence before reusing it in a Facebook post.
-                    </p>
-                {% endif %}
-
-                <small>{{ article.published }}</small>
-
-                <p>{{ article.summary|truncate(500) }}</p>
-
-                <a class="button original"
-                   href="{{ article.link }}"
-                   target="_blank"
-                   rel="noopener noreferrer">
-                    Read Original Article
-                </a>
-
-                <form method="POST"
-                      action="/news/summarize">
-
-                    <input type="hidden"
-                           name="title"
-                           value="{{ article.title }}">
-
-                    <input type="hidden"
-                           name="news_source"
-                           value="{{ article.source }}">
-
-                    <input type="hidden"
-                           name="description"
-                           value="{{ article.summary }}">
-
-                    <input type="hidden"
-                           name="link"
-                           value="{{ article.link }}">
-
-                    <button class="button" type="submit">
-                        Generate AI Summary
-                    </button>
-
-                </form>
-
-            </div>
-
-        {% else %}
-
-            <p>No news articles found.</p>
-
+      <h2>Feed Status</h2>
+      {% if errors %}
+        {% for error in errors %}
+          <div class="error">{{ error }}</div>
         {% endfor %}
+      {% else %}
+        <p>All feeds returned articles.</p>
+      {% endif %}
 
-        <p><a href="/dashboard">Back to Dashboard</a></p>
+      <h2>Latest Articles</h2>
 
+      {% for article in articles %}
+        <div class="article">
+          <div class="source">{{ article.source }}</div>
+          <h3>{{ article.title }}</h3>
+
+          {% if article.image_url %}
+            <img class="article-image"
+                 src="{{ article.image_url }}"
+                 alt="Article image"
+                 loading="lazy">
+            <div class="notice">
+              Image preview only. Confirm you have permission
+              to reuse an image before publishing it.
+            </div>
+          {% endif %}
+
+          <small>{{ article.published }}</small>
+          <p>{{ article.summary|truncate(500) }}</p>
+
+          <a class="button original"
+             href="{{ article.link }}"
+             target="_blank"
+             rel="noopener noreferrer">
+            Read Original Article
+          </a>
+
+          <form method="POST" action="/news/summarize">
+            <input type="hidden" name="title"
+                   value="{{ article.title }}">
+            <input type="hidden" name="news_source"
+                   value="{{ article.source }}">
+            <input type="hidden" name="description"
+                   value="{{ article.summary }}">
+            <input type="hidden" name="link"
+                   value="{{ article.link }}">
+            <input type="hidden" name="image_url"
+                   value="{{ article.image_url or '' }}">
+            <button class="button" type="submit">
+              Generate AI Summary
+            </button>
+          </form>
+        </div>
+      {% else %}
+        <p>No news articles found.</p>
+      {% endfor %}
+
+      <p><a href="/dashboard">Back to Dashboard</a></p>
     </body>
     </html>
     """, articles=articles, errors=errors)
 
 
-# =====================================================
-# AI NEWS SUMMARY - MAIN FEATURE
-# =====================================================
+# =========================================================
+# GENERATE AI NEWS SUMMARY
+# =========================================================
 
 @app.route("/news/summarize", methods=["POST"])
 @login_required
 def summarize_article():
-
     title = request.form.get("title", "").strip()
     news_source = request.form.get("news_source", "").strip()
     description = request.form.get("description", "").strip()
     link = request.form.get("link", "").strip()
+    image_url = request.form.get("image_url", "").strip()
 
     summary = ""
     error_message = ""
 
-    if not title or not link:
-        error_message = "Article title or original link is missing."
-
-    elif not link.startswith(("https://", "http://")):
-        error_message = "Invalid original article link."
-
+    if not title or not valid_http_url(link):
+        error_message = "Article title or original link is invalid."
     elif not groq_client:
         error_message = "Groq API key is not configured in Render."
-
     else:
-
         try:
-
-            news_content = f"""
-            News title: {title}
-
-            News source: {news_source}
-
-            News description: {description}
-
-            Original article link: {link}
-            """
-
             result = groq_client.chat.completions.create(
-
                 model=GROQ_MODEL,
-
                 messages=[
                     {
                         "role": "system",
-                        "content": """
-                        You are NayaDrishti AI, a professional news
-                        editor for a Facebook news page.
-
-                        Create an original, attractive Facebook-ready
-                        news post based only on the information supplied.
-
-                        Rules:
-
-                        1. Write in simple, clear language.
-                        2. Use the language of the original news.
-                        3. Make the headline interesting.
-                        4. Summarize the important facts.
-                        5. Do not copy the original article word for word.
-                        6. Never invent facts, numbers, quotes or events.
-                        7. Do not claim to have independently verified
-                           information.
-                        8. Keep the post concise and readable.
-                        9. Include the original source name.
-                        10. Include the original article link.
-                        11. Use a few relevant hashtags.
-                        12. Do not add unsupported details.
-
-                        Return only the finished Facebook post.
-                        """
+                        "content": (
+                            "You are NayaDrishti AI, a professional "
+                            "news editor for a Facebook news page. "
+                            "Create an original, attractive Facebook "
+                            "post based only on supplied information. "
+                            "Use simple, clear language. Preserve "
+                            "important facts, names, dates and figures. "
+                            "Do not invent facts or unsupported claims. "
+                            "Do not copy the article word for word. "
+                            "Write an interesting headline and concise "
+                            "summary. Include the source name and "
+                            "original article link. Add a few relevant "
+                            "hashtags. Return only the finished post."
+                        )
                     },
                     {
                         "role": "user",
-                        "content": news_content
+                        "content": (
+                            f"Source: {news_source}\n"
+                            f"Title: {title}\n"
+                            f"Description: {description[:5000]}\n"
+                            f"Original link: {link}"
+                        )
                     }
                 ],
-
-                temperature=0.5,
+                temperature=0.4,
                 max_tokens=800,
                 timeout=60
             )
 
-            summary = result.choices[0].message.content or ""
+            summary = (
+                result.choices[0].message.content or ""
+            ).strip()
 
-            if not summary.strip():
+            if not summary:
                 error_message = "Groq returned an empty summary."
 
-        except Exception as error:
-
+        except Exception:
             app.logger.exception("AI summary generation failed.")
-
             error_message = (
                 "AI summary generation failed. "
-                "Please check your Groq configuration and try again."
+                "Check your Groq configuration and Render logs."
             )
 
     return render_template_string("""
     <!DOCTYPE html>
     <html>
     <head>
-        <title>NayaDrishti AI Summary</title>
-
-        <meta name="viewport"
-              content="width=device-width, initial-scale=1">
-
-        <style>
-            body {
-                font-family: Arial;
-                background: #f3f5f8;
-                padding: 20px;
-            }
-
-            .container {
-                background: white;
-                padding: 25px;
-                border-radius: 10px;
-                max-width: 800px;
-                margin: auto;
-            }
-
-            textarea {
-                width: 100%;
-                box-sizing: border-box;
-                padding: 15px;
-                min-height: 280px;
-                font-family: Arial;
-                font-size: 15px;
-                line-height: 1.6;
-            }
-
-            input, button {
-                padding: 12px;
-                margin: 8px 0;
-            }
-
-            .button {
-                background: #1769aa;
-                color: white;
-                border: none;
-                cursor: pointer;
-                text-decoration: none;
-                display: inline-block;
-                border-radius: 5px;
-            }
-
-            .error {
-                color: #b00020;
-                background: #ffe9e9;
-                padding: 12px;
-            }
-
-            .success {
-                color: #126b35;
-            }
-        </style>
+      <title>NayaDrishti AI - Post Preview</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        body {
+          font-family:Arial;
+          background:#f3f5f8;
+          padding:20px;
+        }
+        .container {
+          background:white;
+          padding:25px;
+          border-radius:10px;
+          max-width:800px;
+          margin:auto;
+        }
+        textarea {
+          width:100%;
+          box-sizing:border-box;
+          padding:15px;
+          min-height:280px;
+          font-family:Arial;
+          font-size:15px;
+          line-height:1.6;
+        }
+        .button {
+          background:#1769aa;
+          color:white;
+          border:0;
+          padding:12px 18px;
+          cursor:pointer;
+          border-radius:5px;
+        }
+        .error {
+          color:#b00020;
+          background:#ffe9e9;
+          padding:12px;
+        }
+        .preview-image {
+          width:100%;
+          max-width:650px;
+          max-height:360px;
+          object-fit:cover;
+          border-radius:8px;
+        }
+        .notice {
+          background:#fff8df;
+          padding:12px;
+          border-radius:6px;
+        }
+      </style>
     </head>
-
     <body>
+      <div class="container">
+        <h1>NayaDrishti AI</h1>
+        <h2>Facebook Post Preview</h2>
 
-        <div class="container">
+        {% if error_message %}
+          <div class="error">{{ error_message }}</div>
+        {% else %}
+          <p style="color:green">
+            AI summary generated successfully.
+          </p>
+        {% endif %}
 
-            <h1>NayaDrishti AI</h1>
+        <h3>{{ title }}</h3>
+        <p><b>News source:</b> {{ news_source }}</p>
 
-            <h2>AI News Summary</h2>
+        {% if image_url %}
+          <img class="preview-image"
+               src="{{ image_url }}" alt="Article image">
+          <p class="notice">
+            This is an image preview. Only publish it if you
+            have permission or a suitable license to reuse it.
+          </p>
+        {% endif %}
 
-            {% if error_message %}
-
-                <div class="error">
-                    {{ error_message }}
-                </div>
-
-            {% else %}
-
-                <p class="success">
-                    AI summary generated successfully.
-                </p>
-
-            {% endif %}
-
-            <h3>{{ title }}</h3>
-
-            <p>
-                <b>News source:</b> {{ news_source }}
-            </p>
-
-            <h3>Facebook Post Draft</h3>
-
-            <form method="POST" action="/facebook/publish">
-
-                <label>Generated post</label>
-
-                <textarea name="message"
-                          required>{{ summary }}
+        <form method="POST" action="/facebook/publish">
+          <label><b>Review and edit your Facebook post</b></label>
+          <textarea name="message" required>{{ summary }}
 
 Source: {{ news_source }}
 Original article: {{ link }}</textarea>
 
-                <br>
+          <input type="hidden" name="image_url"
+                 value="{{ image_url }}">
 
-                <button class="button" type="submit">
-                    Continue to Facebook Publishing
-                </button>
+          <br><br>
+          <button class="button" type="submit">
+            Continue to Facebook Publishing
+          </button>
+        </form>
 
-            </form>
-
-            <p>
-                <a href="{{ link }}"
-                   target="_blank"
-                   rel="noopener noreferrer">
-                    Read Original Article
-                </a>
-            </p>
-
-            <p><a href="/news">Back to News</a></p>
-
-            <p><a href="/dashboard">Dashboard</a></p>
-
-        </div>
-
+        <p>
+          <a href="{{ link }}" target="_blank"
+             rel="noopener noreferrer">
+            Read Original Article
+          </a>
+        </p>
+        <p><a href="/news">Back to News</a></p>
+        <p><a href="/dashboard">Dashboard</a></p>
+      </div>
     </body>
     </html>
     """,
@@ -839,104 +731,75 @@ Original article: {{ link }}</textarea>
         news_source=news_source,
         summary=summary,
         link=link,
+        image_url=image_url,
         error_message=error_message
     )
 
 
-# =====================================================
-# MANUAL AI SUMMARY PAGE
-# =====================================================
+# =========================================================
+# MANUAL AI SUMMARY
+# =========================================================
 
 @app.route("/ai", methods=["GET", "POST"])
 @login_required
 def ai():
-
     answer = ""
 
     if request.method == "POST":
-
         news_text = request.form.get("news", "").strip()
 
         if not groq_client:
             answer = "Groq API key is not configured."
-
         elif not news_text:
             answer = "Please enter news text."
-
         else:
-
             try:
-
                 result = groq_client.chat.completions.create(
                     model=GROQ_MODEL,
                     messages=[
                         {
                             "role": "system",
-                            "content": """
-                            You are NayaDrishti AI.
-
-                            Summarize news in simple Nepali or English,
-                            depending on the input language.
-
-                            Create original content.
-                            Do not invent facts.
-                            Preserve important information.
-                            """
+                            "content": (
+                                "You are NayaDrishti AI. Summarize "
+                                "news in simple language. Do not "
+                                "invent facts. Preserve important "
+                                "information."
+                            )
                         },
-                        {
-                            "role": "user",
-                            "content": news_text
-                        }
+                        {"role": "user", "content": news_text}
                     ],
-                    temperature=0.5,
+                    temperature=0.4,
                     max_tokens=800,
                     timeout=60
                 )
-
-                answer = result.choices[0].message.content or ""
-
-            except Exception:
-
-                app.logger.exception("Manual AI summary failed.")
-
                 answer = (
-                    "AI summary failed. Check your Groq configuration "
-                    "and Render logs."
+                    result.choices[0].message.content or ""
                 )
+            except Exception:
+                app.logger.exception("Manual AI summary failed.")
+                answer = "AI summary failed. Check Render logs."
 
     return render_template_string("""
     <h1>NayaDrishti AI Summary</h1>
-
     <form method="POST">
-
-        <textarea name="news"
-                  rows="10"
-                  style="width:90%"
-                  placeholder="Paste news here..."
-                  required></textarea>
-
-        <br><br>
-
-        <button type="submit">Generate Summary</button>
-
+      <textarea name="news" rows="10"
+        style="width:90%"
+        placeholder="Paste news here..." required></textarea>
+      <br><br>
+      <button type="submit">Generate Summary</button>
     </form>
-
     <h3>AI Summary</h3>
-
     <pre style="white-space:pre-wrap">{{ answer }}</pre>
-
     <a href="/dashboard">Back to Dashboard</a>
     """, answer=answer)
 
 
-# =====================================================
-# FACEBOOK API
-# =====================================================
+# =========================================================
+# FACEBOOK API HELPERS
+# =========================================================
 
 def facebook_request(endpoint, token, params=None, method="GET"):
-
     url = f"{GRAPH_URL}/{endpoint.lstrip('/')}"
-
     data = dict(params or {})
     data["access_token"] = token
 
@@ -950,14 +813,11 @@ def facebook_request(endpoint, token, params=None, method="GET"):
 
     try:
         result = response.json()
-
     except ValueError:
         raise Exception("Facebook returned an invalid response.")
 
     if response.status_code >= 400 or "error" in result:
-
         error = result.get("error", {})
-
         raise Exception(
             error.get("message", "Facebook API error")
         )
@@ -965,93 +825,69 @@ def facebook_request(endpoint, token, params=None, method="GET"):
     return result
 
 
-def get_all_pages(endpoint, token, fields):
-
-    results = []
-
-    params = {
-        "fields": fields,
-        "limit": 100
-    }
-
-    next_url = None
-    visited_urls = set()
-
-    for _ in range(50):
-
-        if next_url:
-
-            if next_url in visited_urls:
-                raise Exception("Repeated Facebook pagination URL.")
-
-            visited_urls.add(next_url)
-
-            response = requests.get(
-                next_url,
-                timeout=30
-            )
-
-            result = response.json()
-
-            if response.status_code >= 400 or "error" in result:
-                raise Exception("Facebook pagination failed.")
-
-        else:
-
-            result = facebook_request(
-                endpoint,
-                token,
-                params
-            )
-
-        data = result.get("data")
-
-        if not isinstance(data, list):
-            raise Exception("Facebook returned an invalid Page list.")
-
-        results.extend(
-            item for item in data
-            if isinstance(item, dict)
-        )
-
-        next_url = result.get("paging", {}).get("next")
-
-        if not next_url:
-            return results
-
-        params = None
-
-    raise Exception("Facebook pagination safety limit reached.")
-
-
-def discover_facebook_pages(user_token):
-
-    pages = get_all_pages(
+def get_facebook_pages(user_token):
+    result = facebook_request(
         "me/accounts",
         user_token,
-        "id,name,access_token,tasks"
+        {"fields": "id,name,access_token,tasks", "limit": 100}
     )
 
-    diagnostics = [
-        f"Direct Page lookup: {len(pages)} Page(s) found."
-    ]
+    pages = result.get("data", [])
+    next_url = result.get("paging", {}).get("next")
+    page_count = 1
 
-    return pages, diagnostics
+    while next_url and page_count < 10:
+        response = requests.get(next_url, timeout=30)
+        data = response.json()
+
+        if response.status_code >= 400 or "error" in data:
+            raise Exception("Facebook Page list could not be loaded.")
+
+        pages.extend(data.get("data", []))
+        next_url = data.get("paging", {}).get("next")
+        page_count += 1
+
+    return pages
 
 
-# =====================================================
+def get_selected_page(page_id):
+    """
+    Fetch Page details and Page access token directly from
+    Facebook each time. Do not store Page tokens or Page lists
+    in the browser session.
+    """
+    user_token = session.get("fb_access_token")
+
+    if not user_token:
+        raise Exception("Facebook is not connected. Reconnect first.")
+
+    pages = get_facebook_pages(user_token)
+
+    for page in pages:
+        if str(page.get("id")) == str(page_id):
+            if not page.get("access_token"):
+                raise Exception(
+                    "Facebook did not provide a Page access token. "
+                    "Check Page permissions."
+                )
+            return page
+
+    raise Exception(
+        "The selected Facebook Page was not found. "
+        "Reconnect Facebook and select the Page again."
+    )
+
+# =========================================================
 # FACEBOOK LOGIN
-# =====================================================
+# =========================================================
 
 @app.route("/facebook/login")
 @login_required
 def facebook_login():
-
     if not FB_APP_ID or not FB_APP_SECRET:
-        return "Facebook App ID or App Secret is missing.", 500
+        return "Facebook App ID or App Secret is missing in Render.", 500
 
     state = secrets.token_urlsafe(32)
-
     session["fb_oauth_state"] = state
 
     params = {
@@ -1062,11 +898,8 @@ def facebook_login():
     }
 
     if FB_CONFIG_ID:
-
         params["config_id"] = FB_CONFIG_ID
-
     else:
-
         params["scope"] = ",".join([
             "pages_show_list",
             "pages_read_engagement",
@@ -1081,36 +914,30 @@ def facebook_login():
     return redirect(login_url)
 
 
-# =====================================================
+# =========================================================
 # FACEBOOK CALLBACK
-# =====================================================
+# =========================================================
 
 @app.route("/facebook/callback")
 @login_required
 def facebook_callback():
-
-    error = request.args.get("error")
-
-    if error:
-        return "Facebook login failed. Please try again.", 400
+    if request.args.get("error"):
+        return "Facebook login was cancelled or failed.", 400
 
     returned_state = request.args.get("state")
-
     expected_state = session.pop("fb_oauth_state", None)
 
     if not expected_state or not secrets.compare_digest(
         returned_state or "",
         expected_state
     ):
-        return "Invalid Facebook login state.", 400
+        return "Invalid Facebook login state. Please reconnect.", 400
 
     code = request.args.get("code")
-
     if not code:
-        return "Facebook authorization code missing.", 400
+        return "Facebook authorization code is missing.", 400
 
     try:
-
         response = requests.get(
             f"{GRAPH_URL}/oauth/access_token",
             params={
@@ -1125,168 +952,154 @@ def facebook_callback():
         token_data = response.json()
 
         if response.status_code >= 400 or not token_data.get("access_token"):
-            return "Facebook token exchange failed.", 400
+            app.logger.error(
+                "Facebook token exchange response: %s",
+                token_data.get("error", {}).get("message", "Unknown error")
+            )
+            return "Facebook token exchange failed. Check Render logs.", 400
 
+        # Store only the user access token.
+        # Never store the full Page list or Page tokens in the session.
         session["fb_access_token"] = token_data["access_token"]
-
-        session.pop("fb_pages", None)
 
         return redirect(url_for("facebook_pages"))
 
     except Exception:
-
         app.logger.exception("Facebook callback failed.")
+        return "Facebook connection failed. Check Render logs.", 500
 
-        return "Facebook connection failed.", 500
 
-
-# =====================================================
-# FACEBOOK PAGES
-# =====================================================
+# =========================================================
+# FACEBOOK PAGE LIST
+# =========================================================
 
 @app.route("/facebook")
 @login_required
 def facebook_pages():
+    user_token = session.get("fb_access_token")
 
-    token = session.get("fb_access_token")
-
-    if not token:
+    if not user_token:
         return redirect(url_for("facebook_login"))
 
     try:
+        pages = get_facebook_pages(user_token)
 
-        pages, diagnostics = discover_facebook_pages(token)
-
-        session["fb_pages"] = pages
+        # Pass Page information to the template only.
+        # Do not save the Page list in the session.
+        safe_pages = [
+            {
+                "id": p.get("id"),
+                "name": p.get("name"),
+                "has_token": bool(p.get("access_token"))
+            }
+            for p in pages
+        ]
 
         return render_template_string("""
-        <h1>Your Facebook Pages</h1>
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <title>Facebook Pages - NayaDrishti AI</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <style>
+            body {font-family:Arial;background:#f3f5f8;padding:20px}
+            .card {
+              background:white;padding:18px;margin:12px 0;
+              border-radius:10px;border:1px solid #ddd;
+            }
+            a,button {
+              display:inline-block;padding:10px 14px;
+              background:#1769aa;color:white;text-decoration:none;
+              border:0;border-radius:5px;cursor:pointer;
+            }
+            .good {color:green}
+            .bad {color:#b00020}
+          </style>
+        </head>
+        <body>
+          <h1>Your Facebook Pages</h1>
 
-        {% for page in pages %}
+          {% for page in pages %}
+            <div class="card">
+              <h3>{{ page.name }}</h3>
+              <p>Page ID: {{ page.id }}</p>
 
-            <div style="border:1px solid #ccc;padding:15px;margin:10px">
-
-                <h3>{{ page.name }}</h3>
-
-                <p>Page ID: {{ page.id }}</p>
-
-                {% if page.access_token %}
-
-                    <p style="color:green">
-                        Page access token available
-                    </p>
-
-                    <a href="/facebook/posts/{{ page.id }}">
-                        View Posts
-                    </a>
-
-                    |
-
-                    <a href="/facebook/publish">
-                        Publish Post
-                    </a>
-
-                {% else %}
-
-                    <p style="color:red">
-                        Page access token unavailable.
-                    </p>
-
-                {% endif %}
-
+              {% if page.has_token %}
+                <p class="good">Page access token available</p>
+                <form method="GET" action="/facebook/publish">
+                  <input type="hidden" name="page_id"
+                         value="{{ page.id }}">
+                  <button type="submit">Publish to this Page</button>
+                </form>
+                <p>
+                  <a href="/facebook/posts/{{ page.id }}">
+                    View Page Posts
+                  </a>
+                </p>
+              {% else %}
+                <p class="bad">Page access token unavailable.</p>
+              {% endif %}
             </div>
+          {% else %}
+            <p>No Facebook Pages found for this account.</p>
+          {% endfor %}
 
-        {% else %}
+          <p><a href="/facebook/debug">Permission Details</a></p>
+          <p><a href="/facebook/logout">Disconnect Facebook</a></p>
+          <p><a href="/dashboard">Dashboard</a></p>
+        </body>
+        </html>
+        """, pages=safe_pages)
 
-            <p>No Facebook Pages found.</p>
-
-        {% endfor %}
-
-        <h3>Diagnostics</h3>
-
-        {% for item in diagnostics %}
-            <p>{{ item }}</p>
-        {% endfor %}
-
-        <p><a href="/facebook/debug">Permission Details</a></p>
-
-        <p><a href="/facebook/logout">Disconnect Facebook</a></p>
-
-        <p><a href="/dashboard">Dashboard</a></p>
-
-        """, pages=pages, diagnostics=diagnostics)
-
-    except Exception:
-
+    except Exception as error:
         app.logger.exception("Facebook Page retrieval failed.")
+        return (
+            "Unable to retrieve Facebook Pages: " + str(error),
+            500
+        )
 
-        return "Unable to retrieve Facebook Pages. Check Render logs.", 500
 
-
-# =====================================================
-# FACEBOOK PERMISSION DEBUG
-# =====================================================
+# =========================================================
+# FACEBOOK PERMISSION CHECK
+# =========================================================
 
 @app.route("/facebook/debug")
 @login_required
 def facebook_debug():
-
     token = session.get("fb_access_token")
 
     if not token:
         return redirect(url_for("facebook_login"))
 
     try:
-
-        result = facebook_request(
-            "me/permissions",
-            token
-        )
-
-        permissions = result.get("data") or []
+        result = facebook_request("me/permissions", token)
+        permissions = result.get("data", [])
 
         return render_template_string("""
         <h1>Facebook Permission Details</h1>
-
         {% for permission in permissions %}
-
-            <p>
-                <b>{{ permission.permission }}</b>:
-                {{ permission.status }}
-            </p>
-
+          <p>
+            <b>{{ permission.permission }}</b>:
+            {{ permission.status }}
+          </p>
         {% endfor %}
-
         <a href="/facebook">Back to Facebook Pages</a>
-
         """, permissions=permissions)
 
-    except Exception:
-
+    except Exception as error:
         app.logger.exception("Facebook permission check failed.")
+        return "Permission check failed: " + str(error), 500
 
-        return "Permission check failed.", 500
 
-
-# =====================================================
+# =========================================================
 # VIEW FACEBOOK POSTS
-# =====================================================
+# =========================================================
 
 @app.route("/facebook/posts/<page_id>")
 @login_required
 def facebook_posts(page_id):
-
-    pages = session.get("fb_pages", [])
-
-    page = next(
-        (p for p in pages if p.get("id") == page_id),
-        None
-    )
-
-    if not page or not page.get("access_token"):
-        return "Page or Page access token not found.", 404
-
     try:
+        page = get_selected_page(page_id)
 
         result = facebook_request(
             f"{page_id}/posts",
@@ -1298,191 +1111,246 @@ def facebook_posts(page_id):
         )
 
         return render_template_string("""
-        <h1>{{ page.name }} - Posts</h1>
+        <h1>{{ page_name }} - Posts</h1>
 
         {% for post in posts %}
-
-            <div style="border:1px solid #ccc;padding:15px;margin:10px">
-
-                <p>{{ post.message or "No text" }}</p>
-
-                <small>{{ post.created_time }}</small>
-
-                {% if post.permalink_url %}
-
-                    <br>
-
-                    <a href="{{ post.permalink_url }}"
-                       target="_blank">
-                        Open Post
-                    </a>
-
-                {% endif %}
-
-            </div>
-
+          <div style="border:1px solid #ccc;padding:15px;margin:10px">
+            <p>{{ post.message or "No text" }}</p>
+            <small>{{ post.created_time }}</small>
+            {% if post.permalink_url %}
+              <br>
+              <a href="{{ post.permalink_url }}" target="_blank">
+                Open Post
+              </a>
+            {% endif %}
+          </div>
         {% else %}
-
-            <p>No posts found.</p>
-
+          <p>No posts found.</p>
         {% endfor %}
 
-        <a href="/facebook">Back to Pages</a>
+        <a href="/facebook">Back to Facebook Pages</a>
+        """,
+            page_name=page.get("name", "Facebook Page"),
+            posts=result.get("data", [])
+        )
 
-        """, page=page, posts=result.get("data") or [])
-
-    except Exception:
-
+    except Exception as error:
         app.logger.exception("Facebook post retrieval failed.")
+        return "Unable to load Facebook posts: " + str(error), 500
 
-        return "Unable to load Facebook posts.", 500
 
-
-# =====================================================
-# PUBLISH FACEBOOK POST
-# =====================================================
+# =========================================================
+# FACEBOOK PUBLISHING
+# =========================================================
 
 @app.route("/facebook/publish", methods=["GET", "POST"])
 @login_required
 def facebook_publish():
 
-    pages = session.get("fb_pages", [])
+    user_token = session.get("fb_access_token")
 
-    if not pages:
-        return redirect(url_for("facebook_pages"))
+    if not user_token:
+        return redirect(url_for("facebook_login"))
 
-    if request.method == "POST":
-
-        page_id = request.form.get("page_id", "")
-        message = request.form.get("message", "").strip()
-
-        page = next(
-            (p for p in pages if p.get("id") == page_id),
-            None
+    # Load the current Pages from Facebook each time.
+    try:
+        pages = get_facebook_pages(user_token)
+    except Exception as error:
+        app.logger.exception("Could not load Pages for publishing.")
+        return (
+            "Could not load Facebook Pages. Please reconnect. "
+            + str(error),
+            500
         )
 
-        if not page or not page.get("access_token"):
-            return "Invalid Page or missing Page access token.", 400
+    available_pages = [
+        {
+            "id": page.get("id"),
+            "name": page.get("name")
+        }
+        for page in pages
+        if page.get("id") and page.get("access_token")
+    ]
+
+    if not available_pages:
+        return (
+            "No Page access token is available. "
+            "Reconnect Facebook and check Page permissions.",
+            400
+        )
+
+    if request.method == "POST":
+        page_id = request.form.get("page_id", "").strip()
+        message = request.form.get("message", "").strip()
+
+        if not page_id:
+            return "Please select a Facebook Page.", 400
 
         if not message:
             return "Please enter a post message.", 400
 
+        # Validate that the selected Page belongs to this account
+        # and retrieve its current Page access token.
         try:
+            page = get_selected_page(page_id)
+        except Exception as error:
+            app.logger.exception("Selected Page could not be verified.")
+            return (
+                "Facebook Page verification failed: " + str(error),
+                400
+            )
 
+        try:
+            # Text-only publishing.
+            # Article images are shown in the preview but are not
+            # automatically republished without image-use permission.
             result = facebook_request(
                 f"{page_id}/feed",
                 page["access_token"],
-                {
-                    "message": message
-                },
+                {"message": message},
                 method="POST"
             )
 
             return render_template_string("""
-            <h1 style="color:green">
+            <!DOCTYPE html>
+            <html>
+            <head>
+              <title>Post Published</title>
+              <meta name="viewport" content="width=device-width, initial-scale=1">
+            </head>
+            <body style="font-family:Arial;padding:25px">
+              <h1 style="color:green">
                 Facebook Post Published Successfully!
-            </h1>
+              </h1>
+              <p>Page: {{ page_name }}</p>
+              <p>Post ID: {{ post_id }}</p>
+              <p>
+                <a href="https://www.facebook.com/{{ post_id }}"
+                   target="_blank">
+                  Try opening your Facebook post
+                </a>
+              </p>
+              <p><a href="/facebook">Back to Facebook Pages</a></p>
+              <p><a href="/dashboard">Dashboard</a></p>
+            </body>
+            </html>
+            """,
+                page_name=page.get("name", "Facebook Page"),
+                post_id=result.get("id", "Not returned")
+            )
 
-            <p>Post ID: {{ post_id }}</p>
-
-            <a href="/facebook">Back to Facebook Pages</a>
-
-            <br><br>
-
-            <a href="/dashboard">Dashboard</a>
-
-            """, post_id=result.get("id"))
-
-        except Exception:
-
+        except Exception as error:
             app.logger.exception("Facebook publishing failed.")
+            return (
+                "Facebook could not publish the post: " + str(error),
+                500
+            )
 
-            return "Publishing failed. Check Render logs.", 500
+    selected_page_id = request.args.get("page_id", "").strip()
 
     return render_template_string("""
-    <h1>Publish Facebook Post</h1>
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Publish Facebook Post</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        body {
+          font-family:Arial;background:#f3f5f8;padding:20px;
+        }
+        .card {
+          max-width:750px;margin:auto;background:white;
+          padding:25px;border-radius:10px;
+        }
+        textarea,select {
+          width:100%;box-sizing:border-box;padding:12px;
+          margin-top:10px;
+        }
+        textarea {min-height:260px}
+        button {
+          background:#1877f2;color:white;border:0;
+          padding:13px 20px;border-radius:5px;cursor:pointer;
+        }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <h1>Publish Facebook Post</h1>
 
-    <form method="POST">
-
-        <label>Select Facebook Page</label>
-
-        <br><br>
-
-        <select name="page_id" required>
-
+        <form method="POST">
+          <label>Select Facebook Page</label>
+          <select name="page_id" required>
+            <option value="">Choose your Page</option>
             {% for page in pages %}
-
-                {% if page.access_token %}
-
-                    <option value="{{ page.id }}">
-                        {{ page.name }}
-                    </option>
-
-                {% endif %}
-
+              <option value="{{ page.id }}"
+                {% if page.id == selected_page_id %}selected{% endif %}>
+                {{ page.name }}
+              </option>
             {% endfor %}
+          </select>
 
-        </select>
+          <br><br>
 
-        <br><br>
+          <label>Facebook Post Message</label>
+          <textarea name="message"
+            placeholder="Write your Facebook post..."
+            required>{{ draft }}</textarea>
 
-        <textarea name="message"
-                  rows="12"
-                  cols="55"
-                  placeholder="Write your Facebook post..."
-                  required></textarea>
+          <br><br>
 
-        <br><br>
+          <button type="submit">Publish Facebook Post</button>
+        </form>
 
-        <button type="submit">
-            Publish Facebook Post
-        </button>
-
-    </form>
-
-    <p><a href="/facebook">Back to Facebook</a></p>
-
-    """, pages=pages)
+        <p><a href="/facebook">Back to Facebook Pages</a></p>
+        <p><a href="/dashboard">Dashboard</a></p>
+      </div>
+    </body>
+    </html>
+    """,
+        pages=available_pages,
+        selected_page_id=selected_page_id,
+        draft=request.args.get("message", "")
+    )
 
 
-# =====================================================
+# =========================================================
 # DISCONNECT FACEBOOK
-# =====================================================
+# =========================================================
 
 @app.route("/facebook/logout")
 @login_required
 def facebook_logout():
-
     session.pop("fb_access_token", None)
-    session.pop("fb_pages", None)
     session.pop("fb_oauth_state", None)
-
     return redirect(url_for("dashboard"))
 
 
-# =====================================================
+# =========================================================
 # HEALTH CHECK
-# =====================================================
+# =========================================================
 
 @app.route("/health")
 def health():
-
     return {
         "status": "ok",
         "app": "NayaDrishti AI",
-        "groq_configured": bool(groq_client)
+        "groq_configured": bool(groq_client),
+        "facebook_connected": bool(session.get("fb_access_token"))
     }
 
 
-# =====================================================
+# =========================================================
 # RUN APPLICATION
-# =====================================================
+# =========================================================
 
 if __name__ == "__main__":
-
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 5000)),
         debug=False
     )
-  
+
+
+
+
+   
