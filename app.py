@@ -54,8 +54,10 @@ NEWS_SOURCES = [
         "url": "https://www.ronbpost.com/feed/"
     },
     {
-        "name": "ICC",
-        "url": "https://www.icc-cricket.com/index?feed=rss2"
+        {
+    "name": "ICC",
+    "url": "https://news.google.com/rss/search?q=site%3Aicc-cricket.com%2Fnews&hl=en&gl=NP&ceid=NP%3Aen"
+},"
     },
     {
         "name": "ESPNcricinfo",
