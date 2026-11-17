@@ -2,3 +2,4 @@ Flask
 groq
 requests
 gunicorn
+feedparser
