@@ -18,7 +18,7 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY")
 
 if not app.secret_key:
-    raise RuntimeError("Set FLASK_SECRET_KEY in Render environment variables.")
+    raise RuntimeError("Set FLASK_SECRET_KEY in Render.")
 
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "change-this-password")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
@@ -68,6 +68,9 @@ def facebook_request(endpoint, token, params=None, method="GET"):
             "with an unreadable response."
         )
 
+    if not isinstance(result, dict):
+        raise Exception("Facebook returned an unexpected response format.")
+
     if response.status_code >= 400 or "error" in result:
         error = result.get("error", {})
         raise Exception(
@@ -80,124 +83,125 @@ def facebook_request(endpoint, token, params=None, method="GET"):
 
 
 def get_all_pages(endpoint, token, fields):
-    """Read every page of a Graph API connection."""
-    results = []
-    params = {"fields": fields, "limit": 100}
+    """
+    Safely retrieve all results from a Facebook Graph API connection.
+    Handles null data, invalid responses and pagination.
+    """
 
-    while True:
-        result = facebook_request(endpoint, token, params)
-        results.extend(result.get("data", []))
+    results = []
+    params = {
+        "fields": fields,
+        "limit": 100
+    }
+
+    next_url = None
+    visited_urls = set()
+
+    for page_number in range(50):
+
+        if next_url:
+            if next_url in visited_urls:
+                raise Exception("Facebook returned repeated pagination URLs.")
+
+            visited_urls.add(next_url)
+
+            response = requests.get(
+                next_url,
+                timeout=30
+            )
+
+            try:
+                result = response.json()
+            except ValueError:
+                raise Exception("Facebook pagination returned invalid JSON.")
+
+            if not isinstance(result, dict):
+                raise Exception("Unexpected Facebook pagination response.")
+
+            if response.status_code >= 400 or "error" in result:
+                error = result.get("error", {})
+                raise Exception(
+                    f"{error.get('message', 'Pagination error')} "
+                    f"(code: {error.get('code', 'unknown')})"
+                )
+
+        else:
+            result = facebook_request(
+                endpoint,
+                token,
+                params
+            )
+
+        data = result.get("data")
+
+        # FIX: Never try to iterate over None.
+        if data is None:
+            raise Exception(
+                "Facebook returned data=null instead of a Page list. "
+                "Check Page access and the returned API permissions."
+            )
+
+        if not isinstance(data, list):
+            raise Exception(
+                "Facebook returned an unexpected data format: "
+                + type(data).__name__
+            )
+
+        results.extend(
+            item for item in data if isinstance(item, dict)
+        )
 
         next_url = result.get("paging", {}).get("next")
+
         if not next_url:
-            break
+            return results
 
-        response = requests.get(next_url, timeout=30)
-
-        try:
-            result = response.json()
-        except ValueError:
-            break
-
-        if response.status_code >= 400 or "error" in result:
-            break
-
-        # Continue with the next page using its returned URL.
         params = None
-        endpoint = None
 
-        while True:
-            results.extend(result.get("data", []))
-            next_url = result.get("paging", {}).get("next")
-            if not next_url:
-                return results
-
-            response = requests.get(next_url, timeout=30)
-            result = response.json()
-            if response.status_code >= 400 or "error" in result:
-                return results
+    raise Exception("Stopped after 50 pagination requests for safety.")
 
 
 def discover_facebook_pages(user_token):
-    pages = {}
+    """
+    Retrieve Pages directly from the connected Facebook user.
+    Business Portfolio access is not required for this operation.
+    """
+
     diagnostics = []
 
-    # Method 1: Pages directly available to the Facebook user.
-    try:
-        direct_pages = get_all_pages(
-            "me/accounts",
-            user_token,
-            "id,name,access_token,tasks"
-        )
+    pages = get_all_pages(
+        "me/accounts",
+        user_token,
+        "id,name,access_token,tasks"
+    )
 
-        for page in direct_pages:
-            pages[page["id"]] = page
+    diagnostics.append(
+        f"Direct Page lookup: {len(pages)} Page(s) found."
+    )
 
-        diagnostics.append(
-            f"Direct Page lookup: {len(direct_pages)} Page(s) found."
-        )
+    # Validate the basic information for each returned Page.
+    valid_pages = []
 
-    except Exception as error:
-        diagnostics.append(f"Direct Page lookup: {error}")
+    for page in pages:
+        if not page.get("id") or not page.get("name"):
+            diagnostics.append(
+                "A Page response was missing its ID or name."
+            )
+            continue
 
-    # Method 2: Look through the user's Business Portfolios.
-    try:
-        businesses = get_all_pages(
-            "me/businesses",
-            user_token,
-            "id,name"
-        )
+        valid_pages.append(page)
 
-        diagnostics.append(
-            f"Business Portfolios found: {len(businesses)}."
-        )
-
-    except Exception as error:
-        businesses = []
-        diagnostics.append(f"Business lookup: {error}")
-
-    # Method 3: Check Pages owned by or assigned to each business.
-    for business in businesses:
-        business_id = business.get("id")
-        business_name = business.get("name", "Business")
-
-        for edge in ("owned_pages", "client_pages"):
-            try:
-                business_pages = get_all_pages(
-                    f"{business_id}/{edge}",
-                    user_token,
-                    "id,name,access_token,tasks"
-                )
-
-                diagnostics.append(
-                    f"{business_name} / {edge}: "
-                    f"{len(business_pages)} Page(s)."
-                )
-
-                for page in business_pages:
-                    pages[page["id"]] = page
-
-            except Exception as error:
-                diagnostics.append(
-                    f"{business_name} / {edge}: {error}"
-                )
-
-    # Method 4: Try to obtain a Page token if one was not returned.
-    for page_id, page in pages.items():
         if not page.get("access_token"):
-            try:
-                details = facebook_request(
-                    page_id,
-                    user_token,
-                    {"fields": "id,name,access_token"}
-                )
-                page.update(details)
-            except Exception as error:
-                diagnostics.append(
-                    f"Page {page_id} token lookup: {error}"
-                )
+            diagnostics.append(
+                f"{page['name']}: Facebook did not return a Page token."
+            )
 
-    return list(pages.values()), diagnostics
+    # Business Portfolio lookup intentionally removed.
+    diagnostics.append(
+        "Business Portfolio lookup skipped; direct Page access is being tested."
+    )
+
+    return valid_pages, diagnostics
 
 
 # ---------------- LOGIN ----------------
@@ -224,9 +228,11 @@ def login():
 
     return render_template_string("""
     <h2>NayaDristhi AI Login</h2>
+
     {% for message in get_flashed_messages() %}
       <p style="color:red">{{ message }}</p>
     {% endfor %}
+
     <form method="POST">
       <input type="password" name="password"
              placeholder="Admin password" required>
@@ -249,6 +255,7 @@ def dashboard():
     return render_template_string("""
     <h1>Welcome to NayaDristhi AI</h1>
     <p>Your AI assistant dashboard</p>
+
     <p><a href="/facebook/login">Connect Facebook</a></p>
     <p><a href="/facebook">Facebook Pages</a></p>
     <p><a href="/ai">AI News Summary</a></p>
@@ -268,6 +275,7 @@ def ai():
 
         if not groq_client:
             answer = "Groq API key is not configured."
+
         elif news:
             try:
                 result = groq_client.chat.completions.create(
@@ -276,7 +284,7 @@ def ai():
                         {
                             "role": "system",
                             "content": (
-                                "You are NayaDristhi AI. Summarize news "
+                                "You are NayaDrishti AI. Summarize news "
                                 "clearly in simple Nepali or English, "
                                 "depending on the input language."
                             )
@@ -284,20 +292,24 @@ def ai():
                         {"role": "user", "content": news}
                     ]
                 )
+
                 answer = result.choices[0].message.content
 
             except Exception as error:
                 answer = f"AI error: {error}"
 
     return render_template_string("""
-    <h2>NayaDristhi AI News Summary</h2>
+    <h2>NayaDrishti AI News Summary</h2>
+
     <form method="POST">
       <textarea name="news" rows="10" cols="60"
         placeholder="Paste your news here..." required></textarea><br>
       <button type="submit">Summarize</button>
     </form>
+
     <h3>Summary</h3>
     <pre style="white-space:pre-wrap">{{ answer }}</pre>
+
     <a href="/dashboard">Back to dashboard</a>
     """, answer=answer)
 
@@ -321,15 +333,12 @@ def facebook_login():
     }
 
     if FB_CONFIG_ID:
-        # Use your Facebook Login for Business configuration.
         params["config_id"] = FB_CONFIG_ID
     else:
-        # Standard Facebook Login fallback.
         params["scope"] = ",".join([
             "pages_show_list",
             "pages_read_engagement",
-            "pages_manage_posts",
-            "business_management"
+            "pages_manage_posts"
         ])
 
     login_url = (
@@ -381,19 +390,15 @@ def facebook_callback():
         token_data = response.json()
 
         if response.status_code >= 400 or "access_token" not in token_data:
-            return (
-                "Facebook token error: "
-                + str(token_data.get("error", token_data)),
-                400
-            )
+            return "Facebook token exchange failed.", 400
 
         session["fb_access_token"] = token_data["access_token"]
         session.pop("fb_pages", None)
 
         return redirect(url_for("facebook_pages"))
 
-    except Exception as error:
-        return f"Facebook connection error: {error}", 500
+    except Exception:
+        return "Facebook connection failed. Please try again.", 500
 
 
 # ---------------- FACEBOOK PAGES ----------------
@@ -408,6 +413,7 @@ def facebook_pages():
 
     try:
         pages, diagnostics = discover_facebook_pages(token)
+
         session["fb_pages"] = pages
         session["fb_diagnostics"] = diagnostics
 
@@ -422,6 +428,8 @@ def facebook_pages():
             {% if page.access_token %}
               <p style="color:green">Page access token available</p>
               <a href="/facebook/posts/{{ page.id }}">View Posts</a>
+              |
+              <a href="/facebook/publish">Publish Post</a>
             {% else %}
               <p style="color:red">
                 Page found, but no Page access token was returned.
@@ -430,11 +438,12 @@ def facebook_pages():
           </div>
         {% else %}
           <p style="color:red">
-            No Facebook Pages were returned. See diagnostics below.
+            No Facebook Pages were returned.
           </p>
         {% endfor %}
 
         <h3>Facebook API diagnostics</h3>
+
         {% for item in diagnostics %}
           <p>{{ item }}</p>
         {% endfor %}
@@ -445,7 +454,12 @@ def facebook_pages():
         """, pages=pages, diagnostics=diagnostics)
 
     except Exception as error:
-        return f"Facebook error: {error}", 500
+        return render_template_string("""
+        <h2>Facebook Page retrieval failed</h2>
+        <p style="color:red">{{ error }}</p>
+        <a href="/facebook/debug">Check permissions</a><br>
+        <a href="/dashboard">Dashboard</a>
+        """, error=str(error)), 500
 
 
 # ---------------- FACEBOOK PERMISSION DEBUG ----------------
@@ -459,12 +473,8 @@ def facebook_debug():
         return redirect(url_for("facebook_login"))
 
     try:
-        result = facebook_request(
-            "me/permissions",
-            token
-        )
-
-        permissions = result.get("data", [])
+        result = facebook_request("me/permissions", token)
+        permissions = result.get("data") or []
 
         return render_template_string("""
         <h1>Facebook Permission Details</h1>
@@ -515,6 +525,7 @@ def facebook_posts(page_id):
           <div style="border:1px solid #ccc;padding:15px;margin:10px">
             <p>{{ post.message or "No text" }}</p>
             <small>{{ post.created_time }}</small><br>
+
             {% if post.permalink_url %}
               <a href="{{ post.permalink_url }}" target="_blank">
                 Open Post
@@ -526,7 +537,7 @@ def facebook_posts(page_id):
         {% endfor %}
 
         <a href="/facebook">Back to Pages</a>
-        """, page=page, posts=result.get("data", []))
+        """, page=page, posts=result.get("data") or [])
 
     except Exception as error:
         return f"Unable to load posts: {error}", 500
@@ -579,6 +590,7 @@ def facebook_publish():
 
     <form method="POST">
       <label>Select Page</label><br>
+
       <select name="page_id" required>
         {% for page in pages %}
           <option value="{{ page.id }}">{{ page.name }}</option>
@@ -627,36 +639,15 @@ if __name__ == "__main__":
         debug=False
     )
 
-  
-      
+   
 
-
-
-       
-
-  
         
 
+          
 
-      
-
-    
-      
-            
-
-           
-            
-  
-
+        
+   
 
    
-            
-                          
-                          
-                
 
-                       
-                   
-    
-  
-        
+                           
