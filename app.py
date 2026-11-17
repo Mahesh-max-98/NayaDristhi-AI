@@ -48,16 +48,16 @@ app.config.update(
 
 # ---------------- RSS NEWS SOURCES ----------------
 
+
+        
 NEWS_SOURCES = [
     {
         "name": "Routine of Nepal Banda",
         "url": "https://www.ronbpost.com/feed/"
     },
     {
-        {
-    "name": "ICC",
-    "url": "https://news.google.com/rss/search?q=site%3Aicc-cricket.com%2Fnews&hl=en&gl=NP&ceid=NP%3Aen"
-},"
+        "name": "ICC",
+        "url": "https://news.google.com/rss/search?q=site%3Aicc-cricket.com%2Fnews&hl=en&gl=NP&ceid=NP%3Aen"
     },
     {
         "name": "ESPNcricinfo",
@@ -72,6 +72,7 @@ NEWS_SOURCES = [
         "url": "https://nebnews.net/feed/"
     }
 ]
+
 
 
 def collect_news():
