@@ -279,7 +279,7 @@ def ai():
         elif news:
             try:
                 result = groq_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
+                    model="openai/gpt-oss-120b",
                     messages=[
                         {
                             "role": "system",
