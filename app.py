@@ -2,6 +2,8 @@
 import os
 import secrets
 import requests
+import feedparser
+
 from functools import wraps
 from urllib.parse import urlencode
 
@@ -44,6 +46,94 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Lax"
 )
 
+# ---------------- RSS NEWS SOURCES ----------------
+
+NEWS_SOURCES = [
+    {
+        "name": "Routine of Nepal Banda",
+        "url": "https://www.ronbpost.com/feed/"
+    },
+    {
+        "name": "ICC",
+        "url": "https://www.icc-cricket.com/index?feed=rss2"
+    },
+    {
+        "name": "ESPNcricinfo",
+        "url": "https://www.espncricinfo.com/rss/content/story/feeds/0.xml"
+    },
+    {
+        "name": "ESPN FC",
+        "url": "https://www.espnfc.com/rss"
+    },
+    {
+        "name": "NEB News",
+        "url": "https://nebnews.net/feed/"
+    }
+]
+
+
+def collect_news():
+    """Fetch recent articles from the configured RSS feeds."""
+
+    articles = []
+    errors = []
+
+    headers = {
+        "User-Agent": "NayaDrishtiAI/1.0 (RSS news reader)"
+    }
+
+    for source in NEWS_SOURCES:
+        try:
+            response = requests.get(
+                source["url"],
+                headers=headers,
+                timeout=15
+            )
+
+            response.raise_for_status()
+
+            parsed_feed = feedparser.parse(response.content)
+
+            if not parsed_feed.entries:
+                errors.append(
+                    f"{source['name']}: Feed opened, "
+                    "but no articles were found."
+                )
+                continue
+
+            for entry in parsed_feed.entries[:10]:
+                title = entry.get("title", "").strip()
+                link = entry.get("link", "").strip()
+
+                if not title or not link:
+                    continue
+
+                articles.append({
+                    "source": source["name"],
+                    "title": title,
+                    "link": link,
+                    "published": entry.get(
+                        "published",
+                        entry.get("updated", "Date not available")
+                    ),
+                    "summary": entry.get(
+                        "summary",
+                        "No description available."
+                    )
+                })
+
+        except requests.RequestException as error:
+            errors.append(
+                f"{source['name']}: Could not connect to feed."
+            )
+
+        except Exception:
+            errors.append(
+                f"{source['name']}: Could not read this feed."
+            )
+
+    return articles, errors
+
 
 # ---------------- FACEBOOK API ----------------
 
@@ -83,11 +173,6 @@ def facebook_request(endpoint, token, params=None, method="GET"):
 
 
 def get_all_pages(endpoint, token, fields):
-    """
-    Safely retrieve all results from a Facebook Graph API connection.
-    Handles null data, invalid responses and pagination.
-    """
-
     results = []
     params = {
         "fields": fields,
@@ -134,11 +219,10 @@ def get_all_pages(endpoint, token, fields):
 
         data = result.get("data")
 
-        # FIX: Never try to iterate over None.
         if data is None:
             raise Exception(
                 "Facebook returned data=null instead of a Page list. "
-                "Check Page access and the returned API permissions."
+                "Check Page access and API permissions."
             )
 
         if not isinstance(data, list):
@@ -162,11 +246,6 @@ def get_all_pages(endpoint, token, fields):
 
 
 def discover_facebook_pages(user_token):
-    """
-    Retrieve Pages directly from the connected Facebook user.
-    Business Portfolio access is not required for this operation.
-    """
-
     diagnostics = []
 
     pages = get_all_pages(
@@ -179,7 +258,6 @@ def discover_facebook_pages(user_token):
         f"Direct Page lookup: {len(pages)} Page(s) found."
     )
 
-    # Validate the basic information for each returned Page.
     valid_pages = []
 
     for page in pages:
@@ -196,7 +274,6 @@ def discover_facebook_pages(user_token):
                 f"{page['name']}: Facebook did not return a Page token."
             )
 
-    # Business Portfolio lookup intentionally removed.
     diagnostics.append(
         "Business Portfolio lookup skipped; direct Page access is being tested."
     )
@@ -227,7 +304,7 @@ def login():
         flash("Incorrect password.")
 
     return render_template_string("""
-    <h2>NayaDristhi AI Login</h2>
+    <h2>NayaDrishti AI Login</h2>
 
     {% for message in get_flashed_messages() %}
       <p style="color:red">{{ message }}</p>
@@ -253,14 +330,106 @@ def logout():
 @login_required
 def dashboard():
     return render_template_string("""
-    <h1>Welcome to NayaDristhi AI</h1>
+    <h1>Welcome to NayaDrishti AI</h1>
     <p>Your AI assistant dashboard</p>
 
+    <p><a href="/news">Fetch News</a></p>
     <p><a href="/facebook/login">Connect Facebook</a></p>
     <p><a href="/facebook">Facebook Pages</a></p>
     <p><a href="/ai">AI News Summary</a></p>
     <p><a href="/logout">Logout</a></p>
     """)
+
+
+# ---------------- FETCH NEWS ----------------
+
+@app.route("/news")
+@login_required
+def news():
+    articles, errors = collect_news()
+
+    return render_template_string("""
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>NayaDrishti AI - News</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        body {
+          font-family: Arial, sans-serif;
+          margin: 25px;
+          background: #f4f6f9;
+        }
+        .article {
+          background: white;
+          padding: 15px;
+          margin-bottom: 15px;
+          border-radius: 8px;
+          border: 1px solid #ddd;
+        }
+        .error {
+          color: #b00020;
+          background: #fff0f0;
+          padding: 10px;
+          margin: 8px 0;
+        }
+        a {
+          color: #0757a6;
+        }
+        button {
+          padding: 10px 18px;
+          cursor: pointer;
+        }
+      </style>
+    </head>
+    <body>
+
+      <h1>NayaDrishti AI - Latest News</h1>
+
+      <p>Articles collected: <b>{{ articles|length }}</b></p>
+
+      <p>
+        <a href="/news">
+          <button type="button">Refresh News</button>
+        </a>
+      </p>
+
+      <h2>Feed status</h2>
+
+      {% if errors %}
+        {% for error in errors %}
+          <div class="error">{{ error }}</div>
+        {% endfor %}
+      {% else %}
+        <p>All feeds returned articles.</p>
+      {% endif %}
+
+      <h2>Latest Articles</h2>
+
+      {% for article in articles %}
+        <div class="article">
+          <small><b>{{ article.source }}</b></small>
+
+          <h3>{{ article.title }}</h3>
+
+          <p>{{ article.published }}</p>
+
+          <p>{{ article.summary|striptags|truncate(500) }}</p>
+
+          <a href="{{ article.link }}"
+             target="_blank" rel="noopener noreferrer">
+             Read Original Article
+          </a>
+        </div>
+      {% else %}
+        <p>No articles were collected. Check the feed status above.</p>
+      {% endfor %}
+
+      <p><a href="/dashboard">Back to Dashboard</a></p>
+
+    </body>
+    </html>
+    """, articles=articles, errors=errors)
 
 
 # ---------------- AI NEWS SUMMARY ----------------
@@ -271,12 +440,12 @@ def ai():
     answer = ""
 
     if request.method == "POST":
-        news = request.form.get("news", "").strip()
+        news_text = request.form.get("news", "").strip()
 
         if not groq_client:
             answer = "Groq API key is not configured."
 
-        elif news:
+        elif news_text:
             try:
                 result = groq_client.chat.completions.create(
                     model="openai/gpt-oss-120b",
@@ -286,10 +455,11 @@ def ai():
                             "content": (
                                 "You are NayaDrishti AI. Summarize news "
                                 "clearly in simple Nepali or English, "
-                                "depending on the input language."
+                                "depending on the input language. "
+                                "Do not invent facts."
                             )
                         },
-                        {"role": "user", "content": news}
+                        {"role": "user", "content": news_text}
                     ]
                 )
 
@@ -437,9 +607,7 @@ def facebook_pages():
             {% endif %}
           </div>
         {% else %}
-          <p style="color:red">
-            No Facebook Pages were returned.
-          </p>
+          <p style="color:red">No Facebook Pages were returned.</p>
         {% endfor %}
 
         <h3>Facebook API diagnostics</h3>
@@ -603,8 +771,8 @@ def facebook_publish():
       <button type="submit">Publish Post</button>
     </form>
 
-    <a href="/facebook">Back to Facebook Pages</a>
-    """, pages=pages)
+    <a href="/facebook">Back to Pages</a>
+    """ , pages=pages)
 
 
 # ---------------- DISCONNECT FACEBOOK ----------------
@@ -626,7 +794,7 @@ def facebook_logout():
 def health():
     return {
         "status": "ok",
-        "app": "NayaDristhi AI"
+        "app": "NayaDrishti AI"
     }
 
 
@@ -638,16 +806,3 @@ if __name__ == "__main__":
         port=int(os.environ.get("PORT", 5000)),
         debug=False
     )
-
-   
-
-        
-
-          
-
-        
-   
-
-   
-
-                           
