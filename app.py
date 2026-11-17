@@ -1259,7 +1259,8 @@ def get_all_pages(endpoint, token, fields):
     next_url = None
     visited_urls = set()
 
-    for _ in range(50):        if next_url:
+    for _ in range(50):
+        if next_url:
 
             if next_url in visited_urls:
                 raise Exception("Repeated Facebook pagination URL.")
