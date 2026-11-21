@@ -38,7 +38,7 @@ DATABASE_PATH = os.getenv("DATABASE_PATH", "instance/nayadrishti.sqlite3")
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=os.getenv("COOKIE_SECURE", "true").lower() == "true",
+    SESSION_COOKIE_SECURE=os.getenv("COOKIE_SECURE", "true" if os.getenv("RENDER") else "false").lower() == "true",
     MAX_CONTENT_LENGTH=1 * 1024 * 1024,
 )
 
