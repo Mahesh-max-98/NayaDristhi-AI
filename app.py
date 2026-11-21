@@ -29,7 +29,7 @@ if not app.secret_key or len(app.secret_key) < 32:
 
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 FB_PAGE_ID = os.getenv("FB_PAGE_ID", "")
 FB_PAGE_ACCESS_TOKEN = os.getenv("FB_PAGE_ACCESS_TOKEN", "")
 FB_GRAPH_VERSION = os.getenv("FB_GRAPH_VERSION", "v27.0")
