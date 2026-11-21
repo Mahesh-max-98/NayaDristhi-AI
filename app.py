@@ -4,6 +4,7 @@ import os
 import secrets
 import sqlite3
 from datetime import datetime, timezone
+from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
 from urllib.parse import urlparse
@@ -55,13 +56,21 @@ NEWS_SOURCES = [
 def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
+@contextmanager
 def db_connect():
     path = Path(DATABASE_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(str(path), timeout=20)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
-    return db
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 def init_db():
     with db_connect() as db:
@@ -194,20 +203,24 @@ def poll_feeds():
                 summary = clean(entry.get("summary") or entry.get("description"), 3000)
                 published = clean(entry.get("published") or entry.get("updated"), 120)
                 image_url = extract_image(entry)
-                try:
-                    draft = generate_bilingual_draft(title, summary, source, link)
-                    status = "draft" if draft else "needs_review"
-                except Exception:
-                    log.exception("AI draft generation failed for %s", link)
-                    draft, status = "", "needs_review"
                 with db_connect() as db:
                     cur = db.execute("""
                         INSERT OR IGNORE INTO news_items
-                        (source,title,article_url,summary,published,image_url,draft_text,status,created_at,updated_at)
-                        VALUES (?,?,?,?,?,?,?,?,?,?)
-                    """, (source, title, link, summary, published, image_url, draft, status, utc_now(), utc_now()))
-                    if cur.rowcount:
-                        added += 1
+                        (source,title,article_url,summary,published,image_url,status,created_at,updated_at)
+                        VALUES (?,?,?,?,?,?,'needs_review',?,?)
+                    """, (source, title, link, summary, published, image_url, utc_now(), utc_now()))
+                    is_new = cur.rowcount == 1
+                if not is_new:
+                    continue
+                added += 1
+                if GROQ_API_KEY:
+                    try:
+                        draft = generate_bilingual_draft(title, summary, source, link)
+                        with db_connect() as db:
+                            db.execute("UPDATE news_items SET draft_text=?, status='draft', updated_at=? WHERE article_url=?",
+                                       (draft, utc_now(), link))
+                    except Exception:
+                        log.exception("AI draft generation failed for %s", link)
         except Exception as exc:
             log.warning("Feed failed (%s): %s", source, exc)
             errors.append(source)
